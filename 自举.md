@@ -1,0 +1,204 @@
+
+
+Gentry在2009年论文*Fully Homomorphic Encryption Using Ideal Lattices*提出：如果一个加密方案能评估自身解密电路(evaluate its own decryption circuit)，则可以通过刷新密文噪声实现任意深度的计算，这也就是自举技术。
+
+这里提出的评估自身解密电路的意思是：将原始解密算法改写为同态方案支持的计算形式，对一个噪声已接近崩溃的密文$c=Enc(m)$，提供同一方案的公钥加密的sk(即$Enc(sk)$)，对其同态执行解密的计算:$c'=Dec(Enc(sk), c)$，这里得到的$c'=Enc(m)$，且噪声被重置。
+
+这里的Dec需要被“编译”为同态可计算形式（仅包含加法/乘法的布尔电路），以便于同态计算；如果原始的Dec电路噪声增长过快（比如含除法），需要优化为噪声更友好的等效电路（使用多项式逼近等方法）
+
+
+
+****
+
+
+CKKS的核心思想是将加密错误视为计算过程中产生的计算误差的一部分。在使用密钥对消息进行加密时，解密算法输出原始消息的一个近似值，同时带有较小的误差。方案将密文截断为更小的模数，实现对加密明文的近似舍入。随着同态计算的进行，密文中的模数变得过小，最终无法进行进一步的计算。
+
+
+CKKS自举在大模数下同态计算近似解密函数中的模约减步骤，通过周期函数逼近恢复消息，从而刷新噪声。
+
+****
+
+先说明解密过程中**同态取模**的做法（有密钥sk(X)）：
+找到模运算函数的近似表达式，通过算术运算高效实现，误差足够小，保持输入明文的精度。
+注意到，模运算函数$F(t)=[t]_q$($t \mod q$)在0附近是恒等函数且有周期为q的周期性。如果解密公式$\langle ct, sk\rangle=ct_0+ct_1\cdot s$接近密文模数的倍数(等价地说，密文$m=[t]_q$相对于q较小时)，三角函数可以很好的近似模运算，具体而言可以使用以下缩放的正弦函数来表示解密公式：
+$$[\langle ct, sk\rangle]_q=\frac{q}{2\pi}\cdot\sin(\frac{2\pi}{q}\cdot\langle ct, sk\rangle)+O(\eta^3\cdot q)$$
+其中$|[\langle ct, sk\rangle]_q|\leq \eta\cdot q$.在解密中使用这个解析函数代替模运算
+使用二倍角公式降低计算成本：首先对某些值的$\cos(\frac{2\pi}{q}\cdot\frac{t}{2^r})$和$\sin(\frac{2\pi}{q}\cdot\frac{t}{2^r})$的近似值进行低阶泰勒展开（$\sin x\to x-x^3/6 \cdots$, $\cos x\to 1-x^2/2\cdots$），接下来利用倍角公式递归计算得到$\sin(\frac{2\pi}{q}\cdot t)$的近似值
+
+
+CKKS工作在环：$R_q=\mathbb{Z}_q[X]/(X^N+1)$；密钥：$s\in R_q$；公钥：$(pk_0,pk_1)$满足：
+$$pk_0+pk_1s\approx -as+e$$
+对密文$ct=(c_0,c_1)$，解密形式$m(X)=[c_0+c_1s]_q=\Delta m+e$.
+这里m是编码后的消息，$\Delta$是scale，e是噪声
+
+对于很多次计算后的密文，$q$变得很小，$||e||\approx q$，不能继续计算，希望得到一个$ct'$，满足
+：$c_0'+c_1's=\Delta m+e'$ 要求：$e'<<e$且$q'$恢复到较大值。
+
+****
+
+下面具体说明CKKS自举的几个步骤（论文*Bootstrapping for Approximate Homomorphic Encryption*）：
+
+![[Pasted image 20260805155032.png]]
+
+
+原密文$ct=(c_0,c_1)\in R^2_q$，但是自举需要大模数Q，于是需要将密文从$R_q$提升到$R_Q(Q>>q)$.
+我们希望
+$$c_0'+c_1's\approx \Delta m+e$$
+，但是模数$q\to Q$，
+这里不能直接简单使用$c_0'=c_0, c_1'=c_1$，因为噪声会变大。
+核心思想是：把模数为$q$的密文重新解释乘一个模数为$Q$的密文，然后在大模数下同态计算一次“模q取模”，恢复原始消息。
+
+**1. Modulus Raising（模数提升）**
+这是CKKS特有的步骤，其实只是一个视角转换。利用 CKKS 密文系数表示中的小整数结构，将一个 q 模密文重新解释成 Q 模密文，并保证不会发生新的模约减。
+
+由于$m=[c_0+c_1s]_q$，所以有$c_0+c_1s=qI(X)+m$.
+由于这里$I$的每项系数都有界（不会太大），在模Q意义下有$[c_0+c_1s]_Q=qI(X)+m$.也就是得到
+$$Enc_{Q}(qI+m)$$
+在接下来的步骤中对其进行同态取模q，可以得到$Enc_Q(m)$
+
+
+**2.CTS(Coefficient-to-Slot)**
+这是CKKS自举最关键的一步，目的是将$t(X)=qI(X)+m$从明文表示域下存放embedding结果的slot表示转换为存放系数值的slot表示，具体说明见下文；
+需要的是$t(X)=t_0+t_1X+t_2X^2+\cdots+t_{N-1}X^{N-1}$，但是CKKS密文存储的是$(z_0,z_1,z_2,\cdots,z_{N/2-1})$，需要做一个表示转换，即：
+$$t(X)\to(z_0,z_1,z_2,\cdots,z_{N/2-1})$$
+
+CKKS的标准嵌入$\tau(t)\in\mathbb{C}^{N/2}$把$t(X)$映射成$z=\tau(t)$.这里的$z_i=t(\zeta_i)$.
+展开即$z_i=t_0+t_1\zeta_i+t_2\zeta_i^2+\cdots+t_{N-1}\zeta_i^{N-1}$.
+写成矩阵形式：$z=Ut$，这里的$U$就是范德蒙德矩阵。
+
+由于CKKS最多有$N/2$个复数槽，而系数有$N$个，需要拆成两个密文：
+$ct_a\to z'_0=(t_0,t_1,\cdots,t_{N/2-1})$和$ct_b\to z'_1=(t_{N/2},\cdots,t_{N-1})$
+由于$z=Ut$, 将$U$拆成$[U_a\;\;\; U_b]$.则$z=U_a[t_0, \cdots, t_{N/2-1}]^T+U_b[t_{N/2}, \cdots, t_{N-1}]^T$。其中
+$$
+U_a=
+\begin{bmatrix}
+1 && \zeta_0 && \zeta_0^2 && \cdots && \zeta_0^{\frac{N}{2}-1} \\
+1 && \zeta_1 && \zeta_1^2 && \cdots && \zeta_1^{\frac{N}{2}-1} \\
+\vdots && \vdots && \vdots && \ddots && \vdots \\
+1 && \zeta_{\frac{N}{2}-1} && \zeta_{\frac{N}{2}-1}^2 && \cdots && \zeta_{\frac{N}{2}-1}^{\frac{N}{2}-1} \\
+\end{bmatrix}
+$$ and $$
+U_b=
+\begin{bmatrix}
+\zeta_0^{\frac{N}{2}} && \zeta_0^{\frac{N}{2}+1} && \cdots && \zeta_0^{N-1} \\
+\zeta_1^{\frac{N}{2}} && \zeta_1^{\frac{N}{2}+1} && \cdots && \zeta_1^{N-1} \\
+\vdots && \vdots && \ddots && \vdots \\
+\zeta_{\frac{N}{2}-1}^{\frac{N}{2}} && \zeta_{\frac{N}{2}-1}^{\frac{N}{2}+1} && \cdots && \zeta_{\frac{N}{2}-1}^{N-1} \\
+\end{bmatrix}
+
+$$
+
+($\zeta$是本原单位根)
+
+ModRaise后得到的密文解密后，得到的$t(X)$是槽编码的（CKKS规则），所以当前密文中实际存的是$z=Ut$，我们想拿到的$t=U^{-1}z$。由于这个特殊范德蒙德矩阵的性质，对矩阵$CRT=(U;\overline{U})$有$CRT^{-1}=\frac{1}{N}CRT^*$.这里的$CRT^*$是矩阵的共轭转置。
+我们能得到$ct_k'=\frac{1}{N}(\overline{U_k}^T\cdot z+U_k^T\cdot\overline{z}), k=a,b$.
+
+
+CKKS的明文实际上是槽编码而非系数编码的。通过“Putting polynomial coefficients in plaintext slots”的操作，可以对每个$t_i$独立取模$F(t_i)=t_i\mod q$，为下一步的EvalMod做准备。
+
+
+**3. 同态求模（EvalMod）**
+CKKS不方便直接计算模函数$F(t)=[t]_q$，所以先计算一个周期性的复指数函数，再从中提取正弦函数来近似模函数。（欧拉公式）这里拆分为两个子步骤：
+a. 同态计算复指数函数(Evaluation of the complex exponential function)
+b. 提取虚部(Extraction of the imaginary part)
+
+a. 使用函数$S(t)=\frac{q}{2\pi}\sin(\frac{2\pi t}{q})$作为近似，这里实际计算的是
+$$E(t)=\frac{q}{2\pi}\exp(\frac{2\pi i t}{q})=\frac{q}{2\pi}(\cos\frac{2\pi t}{q}+i\sin\frac{2\pi t}{q})$$
+
+由于此时，输入密文$ct_a$和$ct_b$的明文槽包含系数 $t_j=qI_j+m_j, 0\leq j<N$.那么输出的密文也将在每个对应槽上加密
+$$\frac{q}{2\pi}\exp(\frac{2\pi i t_j}{q})=\frac{q}{2\pi}\exp(\frac{2\pi i m_j}{q})$$
+对上一步得到的$ct_a$和$ct_b$计算$E(ct_a)$和$E(ct_b)$，由于这里槽中存的是$t(X)$的每个系数，于是
+$ct_a^{+}=E(ct_a)$包含$(\frac{q}{2\pi}\exp(\frac{2\pi i t_0}{q}), \frac{q}{2\pi}\exp(\frac{2\pi i t_1}{q}),\cdots)$;
+$ct_b^{+}=E(ct_b)$包含$(\frac{q}{2\pi}\exp(\frac{2\pi i t_{N/2}}{q}), \frac{q}{2\pi}\exp(\frac{2\pi i t_{N/2+1}}{q}),\cdots)$;
+这里复指数的计算具体是采用多项式逼近（泰勒展开）
+
+
+b. 现在每个slot是：$z_j=\frac{q}{2\pi}\exp(\frac{2\pi i t_j}{q})=\frac{q}{2\pi}\exp(\frac{2\pi i m_j}{q})=\frac{q}{2\pi}(\cos\theta_j+i\sin\theta_j)$. $\theta_j=\frac{2\pi m_j}{q}$.
+取虚部就有：$Im(z_j)=\frac{q}{2\pi}sin(\theta_j)\approx m_j$.
+对密文$ct^{+}$取共轭，得到$\overline{ct^{+}}$.
+然后做减法，得到$2i\frac{q}{2\pi}\sin\theta$.再乘 $\frac{1}{2i}$, 得到$\frac{q}{2\pi}\sin\theta\approx m$，完成同态求模操作。
+对两个密文做此操作，得到两个新的密文
+
+
+**4. STC(Slot-to-Coefficient)**
+这是自举的最后一步，要把两个密文槽的所有系数$m_j$打包回单个密文中。这也恰好是CTS变换的逆过程。
+针对给定的两个加密向量$\mathbf{z}_0=(m_0,\cdots,m_{N/2-1})$和$\mathbf{z}_1=(m_{N/2},\cdots,m_{N-1})$，我们的目标是得到$m(X)$的加密，而$m(X)$的槽编码向量$\mathbf{z}=\tau(m)$满足
+$$
+\mathbf{z}=U\cdot\mathbf{m}=U_a\cdot\mathbf{z}_0+U_b\cdot\mathbf{z}_1
+$$
+借此完成切换回系数表示(Switching back to the coefficient representation).
+
+
+
+经过以上4步，得到一个$m(X)$的密文模数$Q_1<Q_0$的加密（cts, 取模, stc需要消耗一定模数）。这里的新模数$Q_1$相比初始的模数$q$已经增加了足够多，支持新的密文计算操作。
+
+****
+
+**误差估计**
+
+详细数学推导过程这里略去（有兴趣自行查找Bootstrapping for Approximate Homomorphic Encryption的5.3 Noise Estimation of Recryption），具体结论如下：
+经过一次 CKKS bootstrapping 后，虽然重新得到的是 m 的加密，但不会完全等于原来的明文 m，而是带有一个新的近似误差 e。这个误差主要来自自举过程中同态近似计算（尤其是复指数函数逼近）以及线性变换带来的数值误差。
+误差界
+$$
+||e||_\infty\leq O(\sqrt{N}\cdot B_{rs})
+$$
+这里的 $B_{rs}$是表示 rescale 引入误差的上界$B_{rs}=\sqrt{N/3}\cdot(3+8\sqrt{h})$，$h$是密钥的汉明权重(secret key Hamming weight)。这个值在$\Delta$的放缩下足够小
+
+****
+
+**一些优化操作**
+1. 最后两个步骤可以进行一定的合并。STC需要消耗一级标量乘法，但需要多次旋转；取模是消耗最多级别的部分，可以通过预先计算线性变换组合一起执行；
+2. 对于稀疏打包密文(Sparsely Packed Ciphertexts)，只有一些特定的位置是有有效数据的。那么在CTS时，可以只刷新有效位置，降低线性变换步骤的复杂性。与此同时，在CTS前需要执行额外的步骤：
+      令$n\geq2$且是$N$的因子，$Y=X^{N/n}$，密文$m(Y)\in子环\mathbb{Z}[Y]/(Y^n+1)$.
+      解密得到的是$\approx q\cdot I(X)+m(Y)$，那么ModRaise返回的就不是Y的多项式
+      我们希望得到的是$\approx q\cdot \overset{\sim}{I(Y)}+m(Y)$。这里的$\overset{\sim}{I(Y)}\in \mathbb{Z}[Y]/(Y^n+1)$.
+      这里需要做的是求PartialSum[^1]，只保留n个维度而非N个维度。
+      通过多次的旋转和加法，将属于同一个子环位置的系数累加在一起（将属于同一个Y系数的多个X系数进行累加，而$m(Y)$ 本身只在低维子环$\mathbb{Z}[Y]/(Y^n+1)$中，PartialSum不会修改$m(Y)$的值，从而让$I(X)\to\overset{\sim}{I(Y)}$）
+3. 论文[Better Bootstrapping for Approximate Homomorphic Encryption](https://eprint.iacr.org/2019/688.pdf)重新设计了$\sin(x)$的同态计算。这里简单不使用倍角公式、切比雪夫多项式/泰勒近似，而是将二者结合起来。
+     通过缩放和平移t，使用对$\cos(2\pi t)$代替对$\sin(2\pi t/q)$的近似，结合倍角公式，这里$t$的值有$t\in U^{K-1}_{i=-K+1}I_i,I_i=[\frac{1}{2^r}(i-1/4-\eta),\frac{1}{2^r}(i-1/4+\eta)]$.
+     希望找到多项式$P(x)$，使得$\underset{x}{\max}|P(x)-\cos(x)|$在区间内最小。这里使用切比雪夫逼近：
+     在取点时满足区间两端的点更密集，而非均匀取点，针对取点得到该分段的切比雪夫逼近。
+     从而达到了降低degree，降低误差的效果。
+4. 使用RNS将大整数计算分解为多个较小整数计算
+5. 论文Efficient Bootstrapping for Approximate Homomorphic Encryption with Non-Sparse Keys采用(double) hoisting技术优化 CTS/STC 的线性变换。
+     在原先的方案中，矩阵乘法被分解为旋转+明文乘+加法实现，这里的操作较为耗时。
+     hoisting通过预先计算多个旋转密钥切换的预处理部分，使得多个rotation操作可以复用，从而降低CTS和STC的开销
+6. 论文Over 100x faster bootstrapping in fully homomorphic encryption through memory-centric optimization with gpus提出了CKKS的Slim自举
+     论文将自举的四个步骤重新排序为STC->ModRaising->CTS->cosine评估；通过推迟模数提升，使STC的计算密文模数变小，降低STC的计算成本。（陈祎论文Fig3 a）
+     Slim Bootstrapping 的核心就是把原本 ModRaise 后的 STC 提前到 ModRaise 前执行，使 STC 在较小 ciphertext modulus 下完成，然后再提升模数进行 CTS 和 EvalMod。
+     这里的STC实际上是一个线性逆运算，因此可以交换顺序。
+
+
+
+
+
+
+[^1]: PartialSum具体算法
+	### PartialSum 算法
+	
+	**Algorithm: Homomorphic evaluation of the partial-sum procedure**
+	
+	**Input:**
+	- 密文 `ct ∈ R_q^2`
+	- 稀疏打包参数 `n | N`，其中 `n ≥ 2`
+	- `n` 表示有效 plaintext slots 的数量
+	
+	**Output:**
+	- 经过部分求和后的密文 `ct'`
+	
+	```text
+	Procedure PartialSum(ct ∈ R_q^2, n | N, n ≥ 2)
+	
+	1:  ct' ← ct (mod q)
+	
+	2:  for j = 0 to log(N/n) − 1 do
+	
+	3:      ct_j ← Rot(ct', 2^j · (n/2)) (mod q)
+	
+	4:      ct' ← Add(ct', ct_j) (mod q)
+	
+	5:  end for
+	
+	6:  return ct'
+	
+	End Procedure
